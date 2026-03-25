@@ -1,4 +1,4 @@
-defmodule ElixirMud.Session do
+defmodule Emud.Session do
   @moduledoc """
   Player session process — sits between the raw TCP connection and the
   game world.  One `Session` process exists per connected player.
@@ -12,35 +12,30 @@ defmodule ElixirMud.Session do
 
   Registration
   ------------
-  When a session is started it registers itself under the player's name
-  in `ElixirMud.Session.Registry` so other processes can find it:
+  Sessions register under the player name in `Emud.Session.Registry`:
 
-      Registry.lookup(ElixirMud.Session.Registry, "Alice")
+      Registry.lookup(Emud.Session.Registry, "Alice")
 
   Usage
   -----
-  Sessions are started by the connection after login:
+  Started by the connection after login:
 
-      {:ok, pid} = Session.start_link(conn_pid: self(), name: "Alice")
+      {:ok, pid} = Emud.Session.start_link(conn_pid: self(), name: "Alice")
 
-  The connection forwards raw input lines as:
+  The connection forwards input lines as:
 
       send(session_pid, {:input, line})
-
-  The session calls back:
-
-      Connection.send_text(conn_pid, "You stand in the void.")
   """
 
   use GenServer
   require Logger
-  alias ElixirMud.Telnet.Connection
+  alias Emud.Telnet.Connection
 
   defstruct [
     :conn_pid,
     :player_name,
-    :room_id,     # placeholder
-    :character    # placeholder map
+    :room_id,
+    :character
   ]
 
   # ─── API ──────────────────────────────────────────────────────────────────
@@ -58,8 +53,7 @@ defmodule ElixirMud.Session do
     conn_pid    = Keyword.fetch!(opts, :conn_pid)
     player_name = Keyword.get(opts, :name, "Anonymous")
 
-    # Register so others can look us up
-    Registry.register(ElixirMud.Session.Registry, player_name, self())
+    Registry.register(Emud.Session.Registry, player_name, self())
 
     state = %__MODULE__{
       conn_pid:    conn_pid,
@@ -72,23 +66,19 @@ defmodule ElixirMud.Session do
     {:ok, state}
   end
 
-  # Input from the TCP connection
   @impl GenServer
   def handle_info({:input, line}, state) do
-    line = String.trim(line)
-    state = dispatch_command(state, line)
+    state = dispatch_command(state, String.trim(line))
     {:noreply, state}
   end
 
-  # GMCP event forwarded by the connection
   def handle_info({:gmcp, package, data}, state) do
-    Logger.debug("Session received GMCP #{package}: #{inspect(data)}")
+    Logger.debug("GMCP #{package}: #{inspect(data)}")
     {:noreply, state}
   end
 
-  # MSDP event forwarded by the connection
   def handle_info({:msdp, var, value}, state) do
-    Logger.debug("Session received MSDP #{var}=#{inspect(value)}")
+    Logger.debug("MSDP #{var}=#{inspect(value)}")
     {:noreply, state}
   end
 
@@ -112,7 +102,6 @@ defmodule ElixirMud.Session do
 
   defp dispatch_command(state, "quit") do
     Connection.send_text(state.conn_pid, "Goodbye!\r\n")
-    # TODO: trigger connection close from connection side
     state
   end
 
@@ -124,12 +113,7 @@ defmodule ElixirMud.Session do
   # ─── Placeholder world data ───────────────────────────────────────────────
 
   defp room_description(:limbo) do
-    """
-    [ The Void ]
-    An infinite grey expanse stretches in every direction.
-    There are no exits.
-
-    """
+    "[ The Void ]\r\nAn infinite grey expanse stretches in every direction.\r\nThere are no exits.\r\n\r\n"
   end
 
   defp room_description(_), do: "You are somewhere.\r\n"

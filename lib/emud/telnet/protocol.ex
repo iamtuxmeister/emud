@@ -1,4 +1,4 @@
-defmodule ElixirMud.Telnet.Protocol do
+defmodule Emud.Telnet.Protocol do
   @moduledoc """
   Pure-functional Telnet byte-stream parser.
 
@@ -8,23 +8,20 @@ defmodule ElixirMud.Telnet.Protocol do
       {state, events} = Protocol.feed(state, raw_bytes)
 
   Events returned:
-    `{:data, binary}`                     — plain text meant for the game
-    `{:will, opt}`                        — client says it WILL support <opt>
-    `{:wont, opt}`                        — client says it WONT support <opt>
-    `{:do, opt}`                          — client requests server DO <opt>
-    `{:dont, opt}`                        — client requests server DONT <opt>
-    `{:subneg, opt, binary}`              — subnegotiation payload for <opt>
-
-  The connection module pattern-matches on these events and delegates to
-  the appropriate protocol handler (MCCP2, GMCP, MSDP, …).
+    `{:data, binary}`       — plain text meant for the game
+    `{:will, opt}`          — client says it WILL support <opt>
+    `{:wont, opt}`          — client says it WONT support <opt>
+    `{:do, opt}`            — client requests server DO <opt>
+    `{:dont, opt}`          — client requests server DONT <opt>
+    `{:subneg, opt, binary}` — subnegotiation payload for <opt>
   """
 
-  alias ElixirMud.Telnet.Options, as: O
+  require Emud.Telnet.Options, as: O
 
   defstruct state: :data,
-            buf:   <<>>,          # accumulates plain text
-            sb_opt: nil,          # option byte for current subneg
-            sb_buf: <<>>          # accumulates subneg payload
+            buf:    <<>>,
+            sb_opt: nil,
+            sb_buf: <<>>
 
   @type t :: %__MODULE__{}
 
@@ -32,27 +29,20 @@ defmodule ElixirMud.Telnet.Protocol do
   @spec new() :: t()
   def new, do: %__MODULE__{}
 
-  @doc """
-  Feed raw bytes into the parser.
-  Returns `{new_state, [event]}`.
-  """
+  @doc "Feed raw bytes into the parser. Returns `{new_state, [event]}`."
   @spec feed(t(), binary()) :: {t(), list()}
   def feed(state, data) when is_binary(data) do
     {state, events_rev} = parse(state, data, [])
-    # Flush any accumulated plain-text buffer
     {state, events_rev} = flush_buf(state, events_rev)
     {state, Enum.reverse(events_rev)}
   end
 
   # ─── Internal parser ──────────────────────────────────────────────────────
 
-  # No more bytes → done
   defp parse(state, <<>>, acc), do: {state, acc}
 
-  # ── :data mode ────────────────────────────────────────────────────────────
-
+  # :data mode
   defp parse(%{state: :data} = s, <<O.iac()::8, rest::binary>>, acc) do
-    # Flush plain text seen so far, enter :iac mode
     {s, acc} = flush_buf(s, acc)
     parse(%{s | state: :iac}, rest, acc)
   end
@@ -61,9 +51,7 @@ defmodule ElixirMud.Telnet.Protocol do
     parse(%{s | buf: <<s.buf::binary, byte::8>>}, rest, acc)
   end
 
-  # ── :iac mode ─────────────────────────────────────────────────────────────
-
-  # Escaped IAC (literal 0xFF in data stream)
+  # :iac mode
   defp parse(%{state: :iac} = s, <<O.iac()::8, rest::binary>>, acc) do
     parse(%{s | state: :data, buf: <<s.buf::binary, 255::8>>}, rest, acc)
   end
@@ -77,37 +65,32 @@ defmodule ElixirMud.Telnet.Protocol do
     parse(%{s | state: {:option, cmd}}, rest, acc)
   end
 
-  # Bare IAC commands we don't handle (GA, NOP, etc.) — skip
   defp parse(%{state: :iac} = s, <<_cmd::8, rest::binary>>, acc) do
     parse(%{s | state: :data}, rest, acc)
   end
 
-  # ── option negotiation (:will/:wont/:do/:dont) ─────────────────────────────
-
+  # option negotiation
   defp parse(%{state: {:option, cmd}} = s, <<opt::8, rest::binary>>, acc) do
-    event = option_event(cmd, opt)
-    parse(%{s | state: :data}, rest, [event | acc])
+    parse(%{s | state: :data}, rest, [option_event(cmd, opt) | acc])
   end
 
-  # ── subnegotiation ────────────────────────────────────────────────────────
-
-  # First byte after SB is the option code
+  # subnegotiation: first byte is the option code
   defp parse(%{state: :sb_opt} = s, <<opt::8, rest::binary>>, acc) do
     parse(%{s | state: :sb_data, sb_opt: opt, sb_buf: <<>>}, rest, acc)
   end
 
-  # IAC inside SB — might be IAC SE (end) or IAC IAC (escaped 0xFF)
+  # IAC SE closes the subneg
   defp parse(%{state: :sb_data} = s, <<O.iac()::8, O.se()::8, rest::binary>>, acc) do
-    event = {:subneg, s.sb_opt, s.sb_buf}
-    parse(%{s | state: :data, sb_opt: nil, sb_buf: <<>>}, rest, [event | acc])
+    parse(%{s | state: :data, sb_opt: nil, sb_buf: <<>>}, rest,
+          [{:subneg, s.sb_opt, s.sb_buf} | acc])
   end
 
+  # IAC IAC inside subneg = escaped 0xFF
   defp parse(%{state: :sb_data} = s, <<O.iac()::8, O.iac()::8, rest::binary>>, acc) do
     parse(%{s | sb_buf: <<s.sb_buf::binary, 255::8>>}, rest, acc)
   end
 
   defp parse(%{state: :sb_data} = s, <<O.iac()::8, _::8, rest::binary>>, acc) do
-    # Malformed — discard the lone IAC and keep going
     parse(s, rest, acc)
   end
 
@@ -118,9 +101,7 @@ defmodule ElixirMud.Telnet.Protocol do
   # ─── Helpers ──────────────────────────────────────────────────────────────
 
   defp flush_buf(%{buf: <<>>} = s, acc), do: {s, acc}
-  defp flush_buf(s, acc) do
-    {%{s | buf: <<>>}, [{:data, s.buf} | acc]}
-  end
+  defp flush_buf(s, acc), do: {%{s | buf: <<>>}, [{:data, s.buf} | acc]}
 
   defp option_event(O.will(), opt), do: {:will, opt}
   defp option_event(O.wont(), opt), do: {:wont, opt}

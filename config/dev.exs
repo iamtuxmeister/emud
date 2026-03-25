@@ -1,5 +1,2 @@
 import Config
-
-config :logger, :console,
-  format: "[$level] $message\n",
-  level: :debug
+config :logger, :console, format: "[$level] $message\n", level: :debug

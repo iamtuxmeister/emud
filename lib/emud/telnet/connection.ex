@@ -1,53 +1,49 @@
-defmodule ElixirMud.Telnet.Connection do
+defmodule Emud.Telnet.Connection do
   @moduledoc """
   Per-connection process — implements both the Ranch `:ranch_protocol`
   behaviour and a plain GenServer.
 
-  Lifecycle
-  ---------
-    1. Ranch accepts a TCP socket and calls `start_link/3`.
-    2. `init/1` takes Ranch socket control, sets `{active, :once}`.
-    3. `handle_info({:tcp, …})` feeds bytes into the Telnet parser.
-    4. Parser events are dispatched to protocol handlers.
-    5. Plain-text input is forwarded to the `Session` process.
-    6. `handle_info({:tcp_closed, …})` / `{:tcp_error, …}` clean up.
+  ## Ranch 2.x + GenServer handshake ordering
 
-  Sending data
-  ------------
-  Other processes can send text to a connection with:
+  `init/1` must return immediately (giving Ranch the pid it needs), so
+  the actual handshake is deferred to `handle_continue(:post_init, …)`,
+  which runs before any other message is processed.
 
-      ElixirMud.Telnet.Connection.send_text(pid, "You see a dragon.")
+  ## Lifecycle
+    1. Ranch acceptor calls `start_link/3`.
+    2. `init/1` stashes {ref, transport}, returns `{:continue, :post_init}`.
+    3. `handle_continue/2` calls `ranch:handshake/1`, activates socket.
+    4. Telnet option burst + welcome banner sent.
+    5. `handle_info({:tcp, …})` feeds bytes into the Telnet parser.
+    6. Parser events dispatched to protocol handlers (GMCP, MSDP, MCCP2).
+    7. Plain-text input forwarded to the `Session` process (once one exists).
+    8. `{:tcp_closed, …}` / `{:tcp_error, …}` clean up.
 
-  The call goes through `handle_cast/2` so the send is serialised on
-  the connection process, preventing interleaved writes.
-
-  Adding new telnet options
-  -------------------------
-  1. Add an `offer_option/1` call in `do_telnet_handshake/1`.
-  2. Add a clause to `handle_event/2` for `{:do, opt}` / `{:will, opt}`.
-  3. Implement your handler module and call it from `handle_event/2`.
+  ## Adding new telnet options
+    1. Add a `will/do` send in `do_telnet_handshake/1`.
+    2. Add a `handle_event/2` clause for `{:do, opt}` / `{:will, opt}`.
+    3. Implement a handler module; call it from `handle_event/2`.
   """
 
   use GenServer
   require Logger
+  require Emud.Telnet.Options, as: Options
 
-  alias ElixirMud.Telnet.{Protocol, Options, MCCP2, GMCP, MSDP}
+  alias Emud.Telnet.{Protocol, Options, MCCP2, GMCP, MSDP}
 
   @behaviour :ranch_protocol
 
-  # How long (ms) to wait for the ranch handshake before giving up
-  @handshake_timeout 5_000
-
   defstruct [
+    :ref,           # Ranch listener ref — used only during handshake
     :socket,
     :transport,
     :session_pid,
-    protocol:  nil,   # %Protocol{}
-    mccp2:     nil,   # %MCCP2{}
-    gmcp:      nil,   # GMCP state map
-    msdp:      nil,   # MSDP state map
-    naws:      nil,   # {cols, rows} or nil
-    ttype:     nil    # terminal type string or nil
+    protocol:  nil,
+    mccp2:     nil,
+    gmcp:      nil,
+    msdp:      nil,
+    naws:      nil,
+    ttype:     nil
   ]
 
   # ─── Ranch protocol entry point ───────────────────────────────────────────
@@ -61,41 +57,42 @@ defmodule ElixirMud.Telnet.Connection do
 
   @impl GenServer
   def init({ref, transport, _opts}) do
-    # Ranch handshake must happen before we do anything with the socket
-    {:ok, socket} = :ranch.handshake(ref, @handshake_timeout)
-
     state = %__MODULE__{
-      socket:    socket,
+      ref:       ref,
       transport: transport,
       protocol:  Protocol.new(),
       mccp2:     MCCP2.new(),
       gmcp:      GMCP.new(),
       msdp:      MSDP.new()
     }
+    {:ok, state, {:continue, :post_init}}
+  end
 
-    # Activate the socket so we receive TCP messages as {:tcp, …}
-    :ok = transport.setopts(socket, active: :once, packet: :raw)
+  # ─── Post-init: handshake, activate socket, greet ─────────────────────────
 
-    # Start the Telnet option handshake and send welcome banner
+  @impl GenServer
+  def handle_continue(:post_init, %{ref: ref, transport: transport} = state) do
+    {:ok, socket} = :ranch.handshake(ref)
+    state = %{state | ref: nil, socket: socket}
+    :ok = transport.setopts(socket, [{:active, :once}, {:packet, :raw}])
     state = do_telnet_handshake(state)
     state = send_welcome(state)
-
-    {:ok, state}
+    {:noreply, state}
   end
 
   # ─── Public API ───────────────────────────────────────────────────────────
 
-  @doc "Send plain text to this connection (may be compressed if MCCP2 active)."
+  @doc "Send plain text to this connection (compressed if MCCP2 active)."
   def send_text(pid, text) when is_binary(text) do
     GenServer.cast(pid, {:send_text, text})
   end
 
-  @doc "Send a pre-built GMCP message to this connection."
+  @doc "Send a GMCP package to this connection."
   def send_gmcp(pid, package, data \\ nil) do
     GenServer.cast(pid, {:send_gmcp, package, data})
   end
 
-  @doc "Send a pre-built MSDP message to this connection."
+  @doc "Send MSDP variables to this connection."
   def send_msdp(pid, vars) when is_map(vars) do
     GenServer.cast(pid, {:send_msdp, vars})
   end
@@ -115,21 +112,17 @@ defmodule ElixirMud.Telnet.Connection do
   end
 
   def handle_cast({:send_msdp, vars}, state) do
-    bytes = MSDP.build_message(vars)
-    {:noreply, do_send_raw(state, bytes)}
+    {:noreply, do_send_raw(state, MSDP.build_message(vars))}
   end
 
   # ─── handle_info — TCP events ─────────────────────────────────────────────
 
   @impl GenServer
   def handle_info({:tcp, socket, data}, %{socket: socket} = state) do
-    # Re-arm the socket for the next packet
-    :ok = state.transport.setopts(socket, active: :once)
-
+    :ok = state.transport.setopts(socket, [{:active, :once}])
     {protocol, events} = Protocol.feed(state.protocol, data)
     state = %{state | protocol: protocol}
     state = Enum.reduce(events, state, &handle_event(&2, &1))
-
     {:noreply, state}
   end
 
@@ -145,110 +138,92 @@ defmodule ElixirMud.Telnet.Connection do
 
   # ─── Telnet event dispatcher ──────────────────────────────────────────────
 
-  # Plain text from the client — forward to session
+  # Plain text — forward to session, or echo if no session yet
   defp handle_event(state, {:data, text}) do
     if state.session_pid do
       send(state.session_pid, {:input, text})
     else
-      # No session yet — echo back for debugging / future login handler
       do_send(state, text)
     end
     state
   end
 
-  # ── Option negotiation ────────────────────────────────────────────────────
-
-  # Client agrees to receive GMCP
+  # GMCP
   defp handle_event(state, {:do, Options.opt_gmcp()}) do
-    Logger.debug("GMCP enabled by client")
-    gmcp = GMCP.enable(state.gmcp)
-    # Send Core.Hello
-    state = %{state | gmcp: gmcp}
+    Logger.debug("GMCP enabled")
+    state = %{state | gmcp: GMCP.enable(state.gmcp)}
     case GMCP.core_hello() do
       {:ok, bytes} -> do_send_raw(state, bytes)
       _            -> state
     end
   end
 
-  # Client declines GMCP
   defp handle_event(state, {:dont, Options.opt_gmcp()}) do
-    Logger.debug("Client refused GMCP")
+    Logger.debug("GMCP refused")
     state
   end
 
-  # Client agrees to receive MSDP
+  # MSDP
   defp handle_event(state, {:do, Options.opt_msdp()}) do
-    Logger.debug("MSDP enabled by client")
-    msdp = MSDP.enable(state.msdp)
-    state = %{state | msdp: msdp}
-    # Advertise reportable variables
-    bytes = MSDP.reportable_variables(["ROOM", "CHAR", "WORLD"])
-    do_send_raw(state, bytes)
+    Logger.debug("MSDP enabled")
+    state = %{state | msdp: MSDP.enable(state.msdp)}
+    do_send_raw(state, MSDP.reportable_variables(["ROOM", "CHAR", "WORLD"]))
   end
 
-  # Client agrees to compression (MCCP2)
+  # MCCP2
   defp handle_event(state, {:do, Options.opt_mccp2()}) do
-    Logger.debug("MCCP2 enabled by client")
+    Logger.debug("MCCP2 enabled")
     {mccp2, handshake} = MCCP2.enable(state.mccp2)
     state = %{state | mccp2: mccp2}
-    # Handshake must be sent uncompressed — use raw transport
-    raw_send(state, handshake)
+    raw_send(state, handshake)   # must be sent uncompressed
     state
   end
 
   defp handle_event(state, {:dont, Options.opt_mccp2()}) do
-    Logger.debug("Client refused MCCP2")
+    Logger.debug("MCCP2 refused")
     state
   end
 
-  # Client reports terminal type
+  # Terminal type
   defp handle_event(state, {:will, Options.opt_ttype()}) do
-    # Ask for the terminal type
-    req = <<Options.iac()::8, Options.sb()::8, Options.opt_ttype()::8, 1::8,
-            Options.iac()::8, Options.se()::8>>
+    req = <<Options.iac()::8, Options.sb()::8, Options.opt_ttype()::8,
+            1::8, Options.iac()::8, Options.se()::8>>
     do_send_raw(state, req)
     state
   end
 
-  # Terminal type subneg response
   defp handle_event(state, {:subneg, Options.opt_ttype(), <<0::8, ttype::binary>>}) do
     Logger.debug("Terminal type: #{ttype}")
     %{state | ttype: ttype}
   end
 
-  # Client reports window size (NAWS)
-  defp handle_event(state, {:will, Options.opt_naws()}) do
-    state
-  end
+  # NAWS
+  defp handle_event(state, {:will, Options.opt_naws()}), do: state
 
   defp handle_event(state, {:subneg, Options.opt_naws(), <<cols::16, rows::16>>}) do
     Logger.debug("Window size: #{cols}x#{rows}")
     %{state | naws: {cols, rows}}
   end
 
-  # Client sends GMCP subneg
+  # GMCP subneg from client
   defp handle_event(state, {:subneg, Options.opt_gmcp(), payload}) do
     {gmcp, action} = GMCP.handle_subneg(state.gmcp, payload)
-    state = %{state | gmcp: gmcp}
-    apply_action(state, action)
+    apply_action(%{state | gmcp: gmcp}, action)
   end
 
-  # Client sends MSDP subneg
+  # MSDP subneg from client
   defp handle_event(state, {:subneg, Options.opt_msdp(), payload}) do
     {msdp, actions} = MSDP.handle_subneg(state.msdp, payload)
-    state = %{state | msdp: msdp}
-    Enum.reduce(actions, state, &apply_action(&2, &1))
+    Enum.reduce(actions, %{state | msdp: msdp}, &apply_action(&2, &1))
   end
 
-  # Gracefully decline anything we don't know
+  # Decline unknown options
   defp handle_event(state, {:will, opt}) do
-    Logger.debug("Sending DONT for unknown option #{opt}")
     raw_send(state, Options.dont(opt))
     state
   end
 
   defp handle_event(state, {:do, opt}) do
-    Logger.debug("Sending WONT for unknown option #{opt}")
     raw_send(state, Options.wont(opt))
     state
   end
@@ -258,25 +233,19 @@ defmodule ElixirMud.Telnet.Connection do
   # ─── Action helpers ───────────────────────────────────────────────────────
 
   defp apply_action(state, :ok), do: state
-
-  defp apply_action(state, {:send, bytes}) do
-    do_send_raw(state, bytes)
-  end
-
+  defp apply_action(state, {:send, bytes}), do: do_send_raw(state, bytes)
   defp apply_action(state, {:event, event}) do
     if state.session_pid, do: send(state.session_pid, event)
     state
   end
-
   defp apply_action(state, actions) when is_list(actions) do
     Enum.reduce(actions, state, &apply_action(&2, &1))
   end
 
-  # ─── Telnet handshake ─────────────────────────────────────────────────────
+  # ─── Telnet option handshake ──────────────────────────────────────────────
 
   defp do_telnet_handshake(state) do
-    # Announce what we support; client will reply DO/DONT for each
-    opts = [
+    burst = [
       Options.will(Options.opt_gmcp()),
       Options.will(Options.opt_msdp()),
       Options.will(Options.opt_mccp2()),
@@ -285,35 +254,29 @@ defmodule ElixirMud.Telnet.Connection do
       Options.will(Options.opt_suppress_go_ahead()),
       Options.do_(Options.opt_suppress_go_ahead())
     ]
-
-    Enum.each(opts, &raw_send(state, &1))
+    raw_send(state, IO.iodata_to_binary(burst))
     state
   end
 
   # ─── Welcome banner ───────────────────────────────────────────────────────
 
   defp send_welcome(state) do
-    banner = Application.get_env(:elixir_mud, :welcome_banner, "Welcome to ElixirMUD\n\n")
+    banner = Application.get_env(:emud, :welcome_banner, "Welcome to EMUD\n\n")
     do_send(state, banner)
   end
 
   # ─── Low-level send ───────────────────────────────────────────────────────
 
-  # Send text, applying MCCP2 compression if active
   defp do_send(state, text) do
-    bytes = MCCP2.compress(state.mccp2, text)
-    raw_send(state, bytes)
+    raw_send(state, MCCP2.compress(state.mccp2, text))
     state
   end
 
-  # Send pre-built protocol bytes (IAC sequences etc.) — also compressed
   defp do_send_raw(state, bytes) do
-    compressed = MCCP2.compress(state.mccp2, bytes)
-    raw_send(state, compressed)
+    raw_send(state, MCCP2.compress(state.mccp2, bytes))
     state
   end
 
-  # Bypass compression — use only for MCCP2 handshake and pre-compression bytes
   defp raw_send(state, bytes) do
     case state.transport.send(state.socket, bytes) do
       :ok              -> :ok
@@ -324,8 +287,8 @@ defmodule ElixirMud.Telnet.Connection do
   # ─── Cleanup ──────────────────────────────────────────────────────────────
 
   defp cleanup(state) do
-    MCCP2.disable(state.mccp2)
-    state.transport.close(state.socket)
+    if state.mccp2, do: MCCP2.disable(state.mccp2)
+    if state.socket, do: state.transport.close(state.socket)
     state
   end
 end
