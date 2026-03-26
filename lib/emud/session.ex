@@ -3,12 +3,12 @@ defmodule Emud.Session do
   Player session process — sits between the raw TCP connection and the
   game world.  One `Session` process exists per connected player.
 
-  Responsibilities (stubs — flesh out as the game grows)
-  -------------------------------------------------------
-  - Authenticate the player (login flow)
+  Responsibilities
+  ----------------
   - Hold the player's in-game state (character, room, stats)
-  - Route input lines to the command parser
+  - Route raw input lines through `Emud.Command.dispatch/2`
   - Route output from the world back to the connection
+  - Handle GMCP / MSDP events forwarded by the connection
 
   Registration
   ------------
@@ -18,18 +18,20 @@ defmodule Emud.Session do
 
   Usage
   -----
-  Started by the connection after login:
+  Start from the connection process after login:
 
       {:ok, pid} = Emud.Session.start_link(conn_pid: self(), name: "Alice")
 
-  The connection forwards input lines as:
+  The connection sends raw input as:
 
       send(session_pid, {:input, line})
   """
 
   use GenServer
   require Logger
+
   alias Emud.Telnet.Connection
+  alias Emud.Command
 
   defstruct [
     :conn_pid,
@@ -38,15 +40,16 @@ defmodule Emud.Session do
     :character
   ]
 
-  # ─── API ──────────────────────────────────────────────────────────────────
+  # --- API ------------------------------------------------------------------
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  @doc "Send text output to this session's connection."
   def send_output(pid, text), do: GenServer.cast(pid, {:output, text})
 
-  # ─── GenServer callbacks ──────────────────────────────────────────────────
+  # --- GenServer callbacks --------------------------------------------------
 
   @impl GenServer
   def init(opts) do
@@ -66,17 +69,20 @@ defmodule Emud.Session do
     {:ok, state}
   end
 
+  # Raw input line from the TCP connection
   @impl GenServer
   def handle_info({:input, line}, state) do
-    state = dispatch_command(state, String.trim(line))
+    state = Command.dispatch(state, String.trim(line))
     {:noreply, state}
   end
 
+  # GMCP event forwarded by the connection
   def handle_info({:gmcp, package, data}, state) do
     Logger.debug("GMCP #{package}: #{inspect(data)}")
     {:noreply, state}
   end
 
+  # MSDP event forwarded by the connection
   def handle_info({:msdp, var, value}, state) do
     Logger.debug("MSDP #{var}=#{inspect(value)}")
     {:noreply, state}
@@ -87,34 +93,4 @@ defmodule Emud.Session do
     Connection.send_text(state.conn_pid, text)
     {:noreply, state}
   end
-
-  # ─── Command dispatcher (stub) ────────────────────────────────────────────
-
-  defp dispatch_command(state, "") do
-    Connection.send_text(state.conn_pid, "\r\n")
-    state
-  end
-
-  defp dispatch_command(state, "look") do
-    Connection.send_text(state.conn_pid, room_description(state.room_id))
-    state
-  end
-
-  defp dispatch_command(state, "quit") do
-    Connection.send_text(state.conn_pid, "Goodbye!\r\n")
-    state
-  end
-
-  defp dispatch_command(state, cmd) do
-    Connection.send_text(state.conn_pid, "Unknown command: #{cmd}\r\n")
-    state
-  end
-
-  # ─── Placeholder world data ───────────────────────────────────────────────
-
-  defp room_description(:limbo) do
-    "[ The Void ]\r\nAn infinite grey expanse stretches in every direction.\r\nThere are no exits.\r\n\r\n"
-  end
-
-  defp room_description(_), do: "You are somewhere.\r\n"
 end

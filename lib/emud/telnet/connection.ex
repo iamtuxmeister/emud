@@ -97,6 +97,11 @@ defmodule Emud.Telnet.Connection do
     GenServer.cast(pid, {:send_msdp, vars})
   end
 
+  @doc "Flush remaining output then close the TCP connection gracefully."
+  def disconnect(pid) do
+    GenServer.cast(pid, :disconnect)
+  end
+
   # ─── handle_cast ──────────────────────────────────────────────────────────
 
   @impl GenServer
@@ -113,6 +118,10 @@ defmodule Emud.Telnet.Connection do
 
   def handle_cast({:send_msdp, vars}, state) do
     {:noreply, do_send_raw(state, MSDP.build_message(vars))}
+  end
+
+  def handle_cast(:disconnect, state) do
+    {:stop, :normal, cleanup(state)}
   end
 
   # ─── handle_info — TCP events ─────────────────────────────────────────────
@@ -152,6 +161,7 @@ defmodule Emud.Telnet.Connection do
   defp handle_event(state, {:do, Options.opt_gmcp()}) do
     Logger.debug("GMCP enabled")
     state = %{state | gmcp: GMCP.enable(state.gmcp)}
+    state = do_send(state, "[GMCP active]\r\n")
     case GMCP.core_hello() do
       {:ok, bytes} -> do_send_raw(state, bytes)
       _            -> state
@@ -167,15 +177,19 @@ defmodule Emud.Telnet.Connection do
   defp handle_event(state, {:do, Options.opt_msdp()}) do
     Logger.debug("MSDP enabled")
     state = %{state | msdp: MSDP.enable(state.msdp)}
+    state = do_send(state, "[MSDP active]\r\n")
     do_send_raw(state, MSDP.reportable_variables(["ROOM", "CHAR", "WORLD"]))
   end
 
   # MCCP2
   defp handle_event(state, {:do, Options.opt_mccp2()}) do
     Logger.debug("MCCP2 enabled")
+    # The echo MUST be sent before enable/1 opens the zlib stream —
+    # everything from the handshake onwards is compressed.
+    state = do_send(state, "[MCCP2 active — compression enabled]\r\n")
     {mccp2, handshake} = MCCP2.enable(state.mccp2)
     state = %{state | mccp2: mccp2}
-    raw_send(state, handshake)   # must be sent uncompressed
+    raw_send(state, handshake)   # handshake itself is the last uncompressed write
     state
   end
 
@@ -217,15 +231,17 @@ defmodule Emud.Telnet.Connection do
     Enum.reduce(actions, %{state | msdp: msdp}, &apply_action(&2, &1))
   end
 
-  # Decline unknown options
+  # Decline unknown options.
+  # MUST use do_send_raw (not raw_send) so the DONT/WONT bytes are
+  # compressed when MCCP2 is already active. Calling raw_send after the
+  # MCCP2 handshake has been sent injects uncompressed bytes into a zlib
+  # stream the client is already inflating, causing Z_DATA_ERROR (-3).
   defp handle_event(state, {:will, opt}) do
-    raw_send(state, Options.dont(opt))
-    state
+    do_send_raw(state, Options.dont(opt))
   end
 
   defp handle_event(state, {:do, opt}) do
-    raw_send(state, Options.wont(opt))
-    state
+    do_send_raw(state, Options.wont(opt))
   end
 
   defp handle_event(state, _event), do: state
